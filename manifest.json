@@ -1,0 +1,14 @@
+{
+  "name": "Fala — radio internetowe",
+  "short_name": "Fala",
+  "description": "Lekkie radio internetowe: wyszukiwarka stacji, ulubione i stacje w Twojej okolicy.",
+  "start_url": "./fala-radio.html",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#0c1614",
+  "theme_color": "#0c1614",
+  "orientation": "portrait",
+  "icons": [
+    { "src": "icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable" }
+  ]
+}

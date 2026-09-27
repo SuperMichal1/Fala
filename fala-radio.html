@@ -446,6 +446,7 @@
   // 4) Paste the generated Client ID below, replacing the placeholder.
   const YT_CLIENT_ID = 'TWOJ_CLIENT_ID.apps.googleusercontent.com';
   const SERVERS = [
+    'https://all.api.radio-browser.info',
     'https://de1.api.radio-browser.info',
     'https://de2.api.radio-browser.info',
     'https://at1.api.radio-browser.info',
@@ -493,6 +494,10 @@
   let lastTrackTitle = null;
   let recentTracks = [];
   let recentOpen = false;
+  let playToken = 0;
+  let playQueue = [];
+  let playQueueIdx = 0;
+  let expandedPlaylist = new Set();
 
   const ICON_PLAY = '<path d="M8 5v14l11-7z"/>';
   const ICON_PAUSE = '<path d="M7 5h4v14H7zM13 5h4v14h-4z"/>';
@@ -549,19 +554,42 @@
   }
 
   // ---------- radio-browser API ----------
+  // Query every mirror in PARALLEL and use whichever answers first, instead of
+  // trying them one-by-one. Radio-browser mirrors occasionally go slow/offline
+  // one at a time; hitting them sequentially meant a single stuck mirror could
+  // eat the whole timeout budget before a working one was even tried, which is
+  // why some stations would randomly seem "not found". Also raised the result
+  // limit so a match doesn't get pushed off the page by more popular stations.
+  function firstSuccessful(promises){
+    return new Promise((resolve, reject) => {
+      let remaining = promises.length;
+      if(!remaining){ reject(new Error('no attempts')); return; }
+      promises.forEach(p => p.then(resolve).catch(() => {
+        remaining--;
+        if(remaining === 0) reject(new Error('all attempts failed'));
+      }));
+    });
+  }
+  async function fetchJsonArray(url, timeoutMs){
+    const ctrl = new AbortController();
+    const t = setTimeout(()=>ctrl.abort(), timeoutMs);
+    try{
+      const resp = await fetch(url, {signal: ctrl.signal});
+      clearTimeout(t);
+      if(!resp.ok) throw new Error('bad status ' + resp.status);
+      const data = await resp.json();
+      if(!Array.isArray(data)) throw new Error('unexpected payload');
+      return data;
+    }catch(e){ clearTimeout(t); throw e; }
+  }
   async function apiSearch(params){
-    const qs = new URLSearchParams(Object.assign({hidebroken:'true', limit:'20', order:'clickcount', reverse:'true'}, params)).toString();
-    for(const server of SERVERS){
-      try{
-        const ctrl = new AbortController();
-        const t = setTimeout(()=>ctrl.abort(), 6000);
-        const resp = await fetch(server + '/json/stations/search?' + qs, {signal: ctrl.signal});
-        clearTimeout(t);
-        if(!resp.ok) continue;
-        return await resp.json();
-      }catch(e){ continue; }
+    const qs = new URLSearchParams(Object.assign({hidebroken:'true', limit:'40', order:'clickcount', reverse:'true'}, params)).toString();
+    const requests = SERVERS.map(server => fetchJsonArray(server + '/json/stations/search?' + qs, 7000));
+    try{
+      return await firstSuccessful(requests);
+    }catch(e){
+      return null;
     }
-    return null;
   }
 
   function stationLogoHtml(station){
@@ -786,7 +814,7 @@
     list.forEach(st => searchResults.appendChild(makeStationRow(st)));
   }
   async function doSearch(){
-    const q = searchInput.value.trim();
+    const q = searchInput.value.trim().replace(/\s+/g, ' ');
     if(!q){ searchStatus.textContent = 'Wpisz nazwę stacji lub gatunek.'; return; }
     searchStatus.textContent = 'Szukam…';
     searchResults.innerHTML = '';
@@ -911,6 +939,98 @@
     recentToggle.style.display = 'none'; recentToggle.classList.remove('open');
     recentList.classList.remove('open'); recentList.innerHTML = '';
   }
+  // Some stations only work through their unresolved "url" (playlist) rather
+  // than "url_resolved", some only over https once this page is loaded over
+  // https (mixed-content blocking), and some list a .pls/.m3u/.m3u8/.asx
+  // playlist file as the stream itself, which <audio> cannot play directly.
+  // Instead of giving up after the first failed attempt, build an ordered
+  // list of candidate URLs and, on failure, unwrap playlists into their real
+  // stream URLs and keep trying until one actually plays.
+  function httpsVariant(url){
+    try{
+      const u = new URL(url);
+      if(u.protocol === 'http:'){ u.protocol = 'https:'; return u.href; }
+    }catch(e){}
+    return null;
+  }
+  function buildInitialCandidates(station){
+    const base = [];
+    const addBase = (u) => { if(u && !base.includes(u)) base.push(u); };
+    addBase(station.url_resolved);
+    addBase(station.url);
+    const list = [];
+    base.forEach(u => {
+      list.push(u);
+      if(location.protocol === 'https:'){
+        const h = httpsVariant(u);
+        if(h && !list.includes(h)) list.push(h);
+      }
+    });
+    return list;
+  }
+  function isLikelyPlaylistUrl(url){
+    return /\.(pls|m3u8?|asx|xspf)(\?|$)/i.test(url || '');
+  }
+  function parsePlaylistText(text, baseUrl){
+    const trimmed = (text || '').trim();
+    if(!trimmed) return [];
+    let urls = [];
+    if(/^\[playlist\]/i.test(trimmed) || /^File\d*\s*=/im.test(trimmed)){
+      trimmed.split(/\r?\n/).forEach(line => {
+        const m = line.match(/^File\d*\s*=\s*(.+)$/i);
+        if(m) urls.push(m[1].trim());
+      });
+    } else if(/^#EXTM3U/i.test(trimmed) || isLikelyPlaylistUrl(baseUrl)){
+      trimmed.split(/\r?\n/).forEach(line => {
+        line = line.trim();
+        if(line && !line.startsWith('#')) urls.push(line);
+      });
+    } else if(/^<asx/i.test(trimmed)){
+      const re = /<ref\s+href\s*=\s*"([^"]+)"/ig;
+      let m; while((m = re.exec(trimmed))) urls.push(m[1]);
+    } else if(/<playlist/i.test(trimmed) && /<location>/i.test(trimmed)){
+      const re = /<location>([^<]+)<\/location>/ig;
+      let m; while((m = re.exec(trimmed))) urls.push(m[1].trim());
+    }
+    return urls.map(u => { try{ return new URL(u, baseUrl).href; }catch(e){ return null; } }).filter(Boolean);
+  }
+  function attemptNextCandidate(station, token){
+    if(token !== playToken) return;
+    if(playQueueIdx >= playQueue.length){
+      resetLoadBar();
+      nowSong.textContent = 'Strumień tej stacji jest obecnie niedostępny.';
+      nowSong.classList.remove('empty');
+      return;
+    }
+    audio.src = playQueue[playQueueIdx];
+    audio.play().catch(err => {
+      if(token !== playToken) return;
+      if(err && err.name === 'NotAllowedError'){
+        resetLoadBar();
+        nowSong.textContent = 'Nie udało się odtworzyć tej stacji.';
+        nowSong.classList.remove('empty');
+      }
+      // other rejections: the media element's own 'error' event (below)
+      // drives the retry/fallback so we don't double-advance the queue.
+    });
+  }
+  async function handleCandidateFailure(station, token, idx){
+    if(token !== playToken || idx !== playQueueIdx) return; // stale/superseded event
+    const candidate = playQueue[idx];
+    if(candidate === undefined) return;
+    if(!expandedPlaylist.has(candidate)){
+      expandedPlaylist.add(candidate);
+      const text = await fetchStatusPage(candidate);
+      if(token !== playToken || idx !== playQueueIdx) return;
+      if(text){
+        const extracted = parsePlaylistText(text, candidate);
+        const fresh = extracted.filter(u => u && !playQueue.includes(u));
+        if(fresh.length) playQueue.splice(idx + 1, 0, ...fresh);
+      }
+    }
+    playQueueIdx = idx + 1;
+    attemptNextCandidate(station, token);
+  }
   function playStation(station){
     if(currentStation && currentStation.stationuuid === station.stationuuid && isPlaying){
       audio.pause();
@@ -920,12 +1040,11 @@
     setNpDisplay(station);
     resetNowPlayingUI();
     startLoadBar();
-    audio.src = station.url_resolved || station.url;
-    audio.play().catch(()=>{
-      resetLoadBar();
-      nowSong.textContent = 'Nie udało się odtworzyć tej stacji.';
-      nowSong.classList.remove('empty');
-    });
+    playToken++;
+    playQueue = buildInitialCandidates(station);
+    playQueueIdx = 0;
+    expandedPlaylist = new Set();
+    attemptNextCandidate(station, playToken);
   }
   function startLoadBar(){
     loadBar.style.transition = 'none';
@@ -965,9 +1084,7 @@
   audio.addEventListener('playing', () => { finishLoadBar(); });
   audio.addEventListener('error', () => {
     if(!currentStation) return;
-    resetLoadBar();
-    nowSong.textContent = 'Strumień tej stacji jest obecnie niedostępny.';
-    nowSong.classList.remove('empty');
+    handleCandidateFailure(currentStation, playToken, playQueueIdx);
   });
 
   playBtn.addEventListener('click', () => {

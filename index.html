@@ -551,6 +551,7 @@
   let playQueueIdx = 0;
   let expandedPlaylist = new Set();
   let homepageScraped = false;
+  let stallTimer = null;
 
   // ---------- debug panel ----------
   // Everything relevant to "why isn't this station playing" gets logged here:
@@ -1090,9 +1091,17 @@
     }catch(e){}
     return null;
   }
+  // Stations whose address in radio-browser is not reachable directly, but whose
+  // own official player uses a different (relay) address. Tried FIRST.
+  const KNOWN_STREAM_OVERRIDES = [
+    { match: /(^|\/\/)online\.jard\.pl(:|\/)/i,
+      urls: ['https://stream3.rdstrm.com/prx-http/online.jard.pl:8744/jard1'] }
+  ];
   function buildInitialCandidates(station){
     const base = [];
     const addBase = (u) => { if(u && !base.includes(u)) base.push(u); };
+    const probe = (station.url_resolved || '') + ' ' + (station.url || '');
+    KNOWN_STREAM_OVERRIDES.forEach(o => { if(o.match.test(probe)) o.urls.forEach(addBase); });
     addBase(station.url_resolved);
     addBase(station.url);
     const list = [];
@@ -1212,7 +1221,14 @@
       return;
     }
     const candidate = playQueue[playQueueIdx];
+    const myIdx = playQueueIdx;
     dbg(`Próba ${playQueueIdx + 1}/${playQueue.length}`, candidate);
+    clearTimeout(stallTimer);
+    stallTimer = setTimeout(() => {
+      if(token !== playToken || myIdx !== playQueueIdx || audio.paused) return;
+      dbg('⏱ Brak startu strumienia w 10 s — przechodzę do kolejnego adresu', candidate);
+      handleCandidateFailure(station, token, myIdx, true);
+    }, 10000);
     audio.src = candidate;
     audio.play().catch(err => {
       if(token !== playToken) return;
@@ -1226,11 +1242,12 @@
       // drives the retry/fallback so we don't double-advance the queue.
     });
   }
-  async function handleCandidateFailure(station, token, idx){
+  async function handleCandidateFailure(station, token, idx, skipExpand){
     if(token !== playToken || idx !== playQueueIdx) return; // stale/superseded event
     const candidate = playQueue[idx];
     if(candidate === undefined) return;
-    if(!expandedPlaylist.has(candidate)){
+    clearTimeout(stallTimer);
+    if(!skipExpand && !expandedPlaylist.has(candidate)){
       expandedPlaylist.add(candidate);
       dbg('Sprawdzam, czy to nie jest plik playlisty (.pls/.m3u/…)', candidate);
       const text = await fetchStatusPage(candidate);
@@ -1256,6 +1273,7 @@
     setNpDisplay(station);
     resetNowPlayingUI();
     startLoadBar();
+    clearTimeout(stallTimer);
     playToken++;
     playQueue = buildInitialCandidates(station);
     playQueueIdx = 0;
@@ -1301,6 +1319,7 @@
     stopPolling();
   });
   audio.addEventListener('playing', () => {
+    clearTimeout(stallTimer);
     dbg('✔ Gra poprawnie', audio.currentSrc || audio.src);
     finishLoadBar();
   });
